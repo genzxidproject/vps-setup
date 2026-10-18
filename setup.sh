@@ -1,0 +1,506 @@
+#!/usr/bin/env bash
+# =============================================================================
+# VPS Setup — interactive server setup for beginners
+# Usage:  sudo ./setup.sh [options]      (see --help)
+# =============================================================================
+set -uo pipefail
+
+VERSION="0.7.0"
+# readlink -f: also correct when started through the /usr/local/bin/vps-setup symlink
+ROOT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+export PATH="$PATH:/usr/sbin:/sbin:/usr/local/sbin"
+
+DRY_RUN=0
+ASSUME_YES=0
+LANG_CODE=""
+PRESET=""
+MANAGE=""          # list_sites | remove_domain | list_databases | drop_database | doctor | update | uninstall
+declare -a SELECTED=()
+declare -A PRESET_SET=()
+
+# shellcheck source=lib/common.sh
+source "$ROOT_DIR/lib/common.sh"
+# shellcheck source=lib/os.sh
+source "$ROOT_DIR/lib/os.sh"
+# shellcheck source=lib/ui.sh
+source "$ROOT_DIR/lib/ui.sh"
+# shellcheck source=lib/manage.sh
+source "$ROOT_DIR/lib/manage.sh"
+# shellcheck source=lib/doctor.sh
+source "$ROOT_DIR/lib/doctor.sh"
+# shellcheck source=lib/i18n/en.sh
+source "$ROOT_DIR/lib/i18n/en.sh"
+
+usage() {
+  cat <<EOF
+VPS Setup $VERSION — set up a fresh Linux server step by step.
+
+Usage: sudo vps-setup [options]        (or, from a cloned repo: sudo ./setup.sh [options])
+
+Options:
+  --preset NAME     recommended | minimal | custom | domain | database | cloudflare (skips the first menu)
+  --lang en|id      Interface language (default: en; asks if not given)
+  --dry-run         Show what would happen without changing anything
+  -y, --yes         Non-interactive: accept defaults (requires --preset)
+  --ssh-key "KEY"   Public SSH key for the admin user (useful with --yes)
+  --webserver NAME  With --yes: nginx | caddy | apache (default: nginx)
+  --add-domain      Jump straight to the "add a website / domain" wizard
+  --email ADDRESS   Email for Let's Encrypt (useful with --yes)
+  --domain NAME     With --yes: domain to add          (needs --preset domain)
+  --site-type TYPE  With --yes: static|spa|proxy|laravel|php|wordpress|redirect
+  --port N          With --yes: app port for --site-type proxy (default 3000)
+  --redirect-to URL With --yes: target for --site-type redirect
+  --app-cmd "CMD"   With --site-type proxy: run the app as a service (app-DOMAIN) with this
+                    start command, inside /var/www/DOMAIN; \$PORT holds the port
+  --hsts            With HTTPS: also send HSTS (browsers then refuse HTTP for a year)
+  --no-workers      With --site-type laravel: skip the scheduler and queue worker services
+  --add-database    Jump straight to the "create a database / user" wizard
+  --engine NAME     With --yes --preset database: postgresql | mysql (default: postgresql)
+  --db NAME         With --yes --preset database: database name to create
+  --db-user NAME    With --yes --preset database: database user (defaults to --db value)
+  --list-sites      List the websites vps-setup created, then exit
+  --remove-domain D Remove website D: web server config (backed up), its Let's Encrypt
+                    certificate and, with --purge-files, its files (moved, never deleted)
+  --purge-files     With --remove-domain: move /var/www/D to /var/backups/vps-setup/removed-sites
+  --keep-cert       With --remove-domain: keep the Let's Encrypt certificate
+  --list-databases  List the PostgreSQL / MySQL databases, then exit
+  --drop-database N Drop database N (a compressed dump is saved first); add --db-user U to drop
+                    that user too, and --engine when both PostgreSQL and MySQL are installed
+                    (--remove-domain and --drop-database ask first; with --yes they do NOT ask)
+  --doctor          Read-only health check: SSH, firewall, services, certificates, backups
+  --update          Update vps-setup itself to the newest version
+  --uninstall       Remove what vps-setup configured (packages stay); asks first
+  -v, --version     Print version
+  -h, --help        Show this help
+
+Examples:
+  sudo vps-setup                           # guided, interactive
+  sudo vps-setup --lang id                 # Bahasa Indonesia
+  sudo vps-setup --dry-run                 # preview only
+  sudo vps-setup --yes --preset recommended --ssh-key "ssh-ed25519 AAAA..."
+  sudo vps-setup --add-domain              # add another website later
+  sudo vps-setup --yes --preset domain --domain app.example.com --site-type proxy --port 3000
+  sudo vps-setup --yes --preset domain --domain app.example.com --site-type proxy --port 3000 --app-cmd "npm start"
+  sudo vps-setup --add-database            # create a database later
+  sudo vps-setup --yes --preset database --engine postgresql --db myapp
+  sudo vps-setup --list-sites
+  sudo vps-setup --remove-domain old.example.com --purge-files
+  sudo vps-setup --drop-database myapp --db-user myapp
+  sudo vps-setup --doctor                  # is everything still healthy?
+EOF
+}
+
+# ------------------------------------------------------------------ arguments
+while (( $# )); do
+  case $1 in
+    -h|--help) usage; exit 0 ;;
+    -v|--version) echo "vps-setup $VERSION"; exit 0 ;;
+    --dry-run) DRY_RUN=1 ;;
+    -y|--yes) ASSUME_YES=1 ;;
+    --preset)  [[ $# -ge 2 ]] || die "--preset needs a value"; PRESET=$2; shift ;;
+    --lang)    [[ $# -ge 2 ]] || die "--lang needs a value"; LANG_CODE=$2; shift ;;
+    --ssh-key) [[ $# -ge 2 ]] || die "--ssh-key needs a value"; CFG[ssh_pubkey]=$2; shift ;;
+    --webserver) [[ $# -ge 2 ]] || die "--webserver needs a value"
+                 [[ $2 =~ ^(nginx|caddy|apache)$ ]] || die "--webserver must be nginx, caddy or apache"
+                 CFG[arg_webserver]=$2; shift ;;
+    --add-domain) PRESET=domain ;;
+    --add-database) PRESET=database ;;
+    --email)   [[ $# -ge 2 ]] || die "--email needs a value"; CFG[arg_email]=$2; shift ;;
+    --domain)  [[ $# -ge 2 ]] || die "--domain needs a value"; CFG[arg_domain]=$2; shift ;;
+    --site-type) [[ $# -ge 2 ]] || die "--site-type needs a value"; CFG[arg_type]=$2; shift ;;
+    --port)    [[ $# -ge 2 ]] || die "--port needs a value"; CFG[arg_port]=$2; shift ;;
+    --redirect-to) [[ $# -ge 2 ]] || die "--redirect-to needs a value"; CFG[arg_target]=$2; shift ;;
+    --app-cmd) [[ $# -ge 2 ]] || die "--app-cmd needs a value"; CFG[arg_app_cmd]=$2; shift ;;
+    --hsts)    CFG[arg_hsts]=1 ;;
+    --no-workers) CFG[arg_no_workers]=1 ;;
+    --engine)  [[ $# -ge 2 ]] || die "--engine needs a value"
+               [[ $2 =~ ^(postgresql|mysql)$ ]] || die "--engine must be postgresql or mysql"
+               CFG[arg_engine]=$2; shift ;;
+    --db)      [[ $# -ge 2 ]] || die "--db needs a value"; CFG[arg_db]=$2; shift ;;
+    --db-user) [[ $# -ge 2 ]] || die "--db-user needs a value"; CFG[arg_db_user]=$2; shift ;;
+    --list-sites)     MANAGE=list_sites ;;
+    --remove-domain)  [[ $# -ge 2 ]] || die "--remove-domain needs a value"; MANAGE=remove_domain; CFG[arg_manage]=$2; shift ;;
+    --purge-files)    CFG[arg_purge]=1 ;;
+    --keep-cert)      CFG[arg_keep_cert]=1 ;;
+    --list-databases) MANAGE=list_databases ;;
+    --drop-database)  [[ $# -ge 2 ]] || die "--drop-database needs a value"; MANAGE=drop_database; CFG[arg_manage]=$2; shift ;;
+    --doctor)         MANAGE=doctor ;;
+    --update)         MANAGE=update ;;
+    --uninstall)      MANAGE=uninstall ;;
+    *) echo "Unknown option: $1" >&2; usage >&2; exit 2 ;;
+  esac
+  shift
+done
+
+# ------------------------------------------------------------------ preflight
+preflight_root() {
+  [[ $MANAGE == doctor ]] && return 0   # read-only: works without root (with a notice)
+  if (( EUID != 0 && DRY_RUN == 0 )); then die "$(t err.root)"; fi
+}
+
+# --update: a git checkout pulls; an installed copy (curl | bash) is replaced by the newest release
+# of install.sh, which keeps state (/etc/vps-setup, /var/lib/vps-setup) untouched.
+self_update() {
+  local repo=${VPS_SETUP_REPO:-orlinkzz/vps-setup} ref=${VPS_SETUP_REF:-main}
+  if [[ -d $ROOT_DIR/.git ]] && command -v git >/dev/null 2>&1; then
+    log_info "$(t update.git "$ROOT_DIR")"
+    if (( DRY_RUN )); then log_dry "git -C $ROOT_DIR pull --ff-only"; return 0; fi
+    git -C "$ROOT_DIR" pull --ff-only || { log_err "$(t update.failed)"; return 1; }
+  else
+    log_info "$(t update.download "$repo@$ref" "$ROOT_DIR")"
+    if (( DRY_RUN )); then log_dry "install.sh from $repo@$ref into $ROOT_DIR"; return 0; fi
+    curl -fsSL "https://raw.githubusercontent.com/$repo/$ref/install.sh" \
+      | VPS_SETUP_DIR="$ROOT_DIR" VPS_SETUP_REF="$ref" VPS_SETUP_REPO="$repo" VPS_SETUP_NO_RUN=1 bash \
+      || { log_err "$(t update.failed)"; return 1; }
+  fi
+  log_ok "$(t update.done "$(bash "$ROOT_DIR/setup.sh" --version 2>/dev/null)")"
+}
+
+# Interactive "Manage" menu: the same commands as --list-sites, --remove-domain, ... without flags.
+manage_menu() {
+  local c out name title
+  title=$(t menu.manage.title)
+  while true; do
+    c=$(ui_menu "$title" "$(t menu.manage.text)" doctor \
+      doctor         "$(t menu.manage.doctor)" \
+      list_sites     "$(t menu.manage.list_sites)" \
+      remove_domain  "$(t menu.manage.remove_domain)" \
+      list_databases "$(t menu.manage.list_databases)" \
+      drop_database  "$(t menu.manage.drop_database)" \
+      back           "$(t menu.manage.back)") || return 0
+    case $c in
+      doctor|list_sites|list_databases)
+        out=$( { if [[ $c == doctor ]]; then doctor_main; else "$c"; fi; } 2>&1 | sed 's/\x1b\[[0-9;]*m//g')
+        ui_scroll "$title" "$out" ;;
+      remove_domain|drop_database)
+        if [[ $c == remove_domain ]]; then out=$(t menu.manage.ask_remove_domain); else out=$(t menu.manage.ask_drop_database); fi
+        name=$(ui_input "$title" "$out" "") || continue
+        [[ -n $name ]] || continue
+        clear
+        "$c" "$name"
+        read -r -p "$(t menu.manage.press_enter)" _ ;;
+      back) return 0 ;;
+    esac
+  done
+}
+
+# Two runs at the same time would fight over apt/dnf locks and half-written configs.
+acquire_lock() {
+  (( DRY_RUN )) && return 0
+  [[ $MANAGE == doctor ]] && return 0
+  command -v flock >/dev/null 2>&1 || return 0
+  # The braces keep "2>/dev/null" for this one line only; on "exec" itself it would hide stderr for good
+  { exec 9>/run/vps-setup.lock; } 2>/dev/null || return 0
+  flock -n 9 || die "$(t err.locked)"
+}
+
+# The per-feature state file can hold generated passwords: never leave it behind, also not on Ctrl-C.
+STATEF=""
+cleanup_on_exit() { [[ -n $STATEF ]] && rm -f "$STATEF"; return 0; }
+on_interrupt() { echo >&2; log_warn "$(t run.interrupted)"; exit 130; }
+
+ensure_whiptail() {
+  (( ASSUME_YES )) && return 0
+  command -v whiptail >/dev/null 2>&1 && return 0
+  echo "Installing whiptail (needed for the menus)..."
+  if (( EUID != 0 )); then die "$(t err.root)"; fi
+  if command -v apt-get >/dev/null 2>&1; then
+    DEBIAN_FRONTEND=noninteractive apt-get update -qq >>"$LOG_FILE" 2>&1
+    DEBIAN_FRONTEND=noninteractive apt-get install -y -qq whiptail >>"$LOG_FILE" 2>&1 \
+      || die "Could not install whiptail (see $LOG_FILE)"
+  elif command -v dnf >/dev/null 2>&1; then
+    dnf -y -q install newt >>"$LOG_FILE" 2>&1 || die "Could not install whiptail (see $LOG_FILE)"
+  else
+    die "$(t err.no_apt)"
+  fi
+}
+
+choose_language() {
+  if [[ -z $LANG_CODE ]]; then
+    if (( ASSUME_YES )); then
+      LANG_CODE=en
+    else
+      LANG_CODE=$(ui_menu "$(t lang.title)" "$(t lang.text)" en en "English" id "Bahasa Indonesia") || quit_cancel
+    fi
+  fi
+  case $LANG_CODE in
+    en) ;;
+    id) # shellcheck source=lib/i18n/id.sh
+        source "$ROOT_DIR/lib/i18n/id.sh" ;;
+    *) die "$(t err.bad_lang "$LANG_CODE")" ;;
+  esac
+  ui_init
+}
+
+quit_cancel() { echo; log_info "$(t msg.cancelled)"; exit 130; }
+
+check_os() {
+  detect_os || die "$(t err.os_unsupported "unknown")"
+  local rc=0
+  os_check || rc=$?
+  case $rc in
+    2) die "$(t err.os_unsupported "$OS_PRETTY")" ;;
+    1) ui_msg "$OS_PRETTY" "$(t warn.os_untested "$OS_PRETTY")" ;;
+    3) # End of life: warn, and ask before going on (--yes only prints the warning).
+       if (( ASSUME_YES )); then
+         log_warn "$(t warn.os_eol "$OS_PRETTY")"
+       else
+         ui_yesno "$OS_PRETTY" "$(t warn.os_eol "$OS_PRETTY")\n\n$(t warn.os_eol_ask)" no || quit_cancel
+       fi ;;
+  esac
+}
+
+load_modules() {
+  local family=$OS_ID dir f
+  # Rocky / RHEL / CentOS use the AlmaLinux module set (same dnf-based family).
+  case "$OS_ID" in rocky|rhel|centos) family=almalinux ;; esac
+  dir="$ROOT_DIR/modules/$family"
+  [[ -d $dir ]] || die "$(t err.os_unsupported "$OS_PRETTY")"
+  for f in "$dir"/*.sh; do
+    # shellcheck source=/dev/null
+    source "$f"
+  done
+}
+
+# Warn early when the machine is not a real server (WSL) or has no systemd.
+check_environment() {
+  local title text
+  if is_wsl; then
+    title=$(t env.wsl.title); text=$(t env.wsl.text)
+  elif ! has_systemd; then
+    title=$(t env.nosystemd.title); text=$(t env.nosystemd.text)
+  else
+    return 0
+  fi
+  if (( ASSUME_YES )); then log_warn "$text"; return 0; fi
+  ui_yesno "$title" "$text" no || quit_cancel
+}
+
+# ------------------------------------------------------------------ menus
+show_help() {
+  local id text=""
+  for id in "${FEATURE_IDS[@]}"; do
+    text+="$(t "feat.$id.title")"$'\n'"  $(t "feat.$id.desc")"$'\n\n'
+  done
+  ui_scroll "$(t help.title)" "$text"
+}
+
+welcome() {
+  ui_msg "$(t welcome.title)" "$(t welcome.text "$OS_PRETTY" "$MEM_MB" "$CPU_COUNT" "$LOG_FILE")"
+}
+
+select_preset() {
+  local choice
+  [[ -n $PRESET ]] && return 0
+  while true; do
+    choice=$(ui_menu "$(t menu.main.title)" "$(t menu.main.text)" recommended \
+      recommended "$(t menu.recommended)" \
+      minimal "$(t menu.minimal)" \
+      custom "$(t menu.custom)" \
+      domain "$(t menu.domain)" \
+      database "$(t menu.database)" \
+      cloudflare "$(t menu.cloudflare)" \
+      manage "$(t menu.manage)" \
+      help "$(t menu.help)" \
+      quit "$(t menu.quit)") || quit_cancel
+    case $choice in
+      manage) manage_menu ;;
+      help) show_help ;;
+      quit) quit_cancel ;;
+      *) PRESET=$choice; return 0 ;;
+    esac
+  done
+}
+
+load_preset() {
+  local name=$1 f="$ROOT_DIR/presets/$1.list" id
+  PRESET_SET=()
+  if [[ $name == custom ]]; then
+    for id in "${FEATURE_IDS[@]}"; do
+      [[ ${FEATURE_DEFAULT[$id]} == on ]] && PRESET_SET[$id]=1
+    done
+    return 0
+  fi
+  [[ -f $f ]] || die "$(t err.no_preset "$name")"
+  # "|| [[ -n $id ]]" supaya baris terakhir tanpa newline tetap terbaca
+  while IFS= read -r id || [[ -n $id ]]; do
+    id=${id%%#*}; id=${id//[[:space:]]/}
+    [[ -n $id ]] && PRESET_SET[$id]=1
+  done <"$f"
+}
+
+select_features() {
+  local id state chosen
+  local -a args=()
+  load_preset "$PRESET"
+  for id in "${FEATURE_IDS[@]}"; do
+    state=off
+    [[ -n ${PRESET_SET[$id]:-} ]] && state=on
+    args+=("$id" "$(t "feat.$id.title")" "$state")
+  done
+  chosen=$(ui_checklist "$(t select.title)" "$(t select.text)" "${args[@]}") || quit_cancel
+  SELECTED_SET=()
+  for id in $chosen; do SELECTED_SET[$id]=1; done
+  if (( ${#SELECTED_SET[@]} == 0 )); then log_info "$(t select.none)"; exit 0; fi
+}
+
+prompt_features() {
+  local id dropped=""
+  for id in "${FEATURE_IDS[@]}"; do
+    feature_selected "$id" || continue
+    declare -F "prompt_$id" >/dev/null || continue
+    if ! "prompt_$id"; then
+      log_warn "$(t prompt.skipped "$(t "feat.$id.title")")"
+      dropped+="  - $(t "feat.$id.title")"$'\n'
+      unset "SELECTED_SET[$id]"
+    fi
+  done
+  # Dialog whiptail menghapus pesan log di atas, jadi tampilkan daftar fitur yang gugur
+  # secara eksplisit. Sebelumnya fitur terpilih bisa hilang tanpa kabar.
+  if [[ -n $dropped ]]; then
+    ui_msg "$(t prompt.dropped.title)" "$(t prompt.dropped.text "$dropped")"
+  fi
+  if (( ${#SELECTED_SET[@]} == 0 )); then log_info "$(t select.none)"; exit 0; fi
+}
+
+review() {
+  local id text n=0 line
+  text="$(t review.head)"$'\n\n'
+  (( DRY_RUN )) && text+="$(t review.dry)"$'\n\n'
+  for id in "${FEATURE_IDS[@]}"; do
+    feature_selected "$id" || continue
+    n=$((n + 1))
+    text+="$n. $(t "feat.$id.title")"$'\n'
+    if declare -F "summary_$id" >/dev/null; then
+      line=$("summary_$id")
+      text+="     $line"$'\n'
+    fi
+  done
+  text+=$'\n'"$(t review.ask)"
+  ui_yesno "$(t review.title)" "$text" yes || quit_cancel
+}
+
+# ------------------------------------------------------------------ execution
+run_features() {
+  local id title i=0 total=0 rc statef
+  for id in "${FEATURE_IDS[@]}"; do feature_selected "$id" && total=$((total + 1)); done
+  (( DRY_RUN )) && log_dry "no changes will be made"
+
+  for id in "${FEATURE_IDS[@]}"; do
+    feature_selected "$id" || continue
+    i=$((i + 1))
+    title=$(t "feat.$id.title")
+    log_step "[$i/$total] $title"
+    rc=0
+    # Fitur berjalan di subshell, jadi nilai CFG yang diisi saat instalasi (port SSH akhir,
+    # password MySQL, dll.) hilang begitu subshell selesai. Simpan ke file sementara (600)
+    # lalu muat lagi supaya ringkasan/catatan akhir memakai nilai yang benar.
+    statef=$(mktemp); STATEF=$statef
+    ( set -e
+      # shellcheck disable=SC2064
+      trap "declare -p CFG >\"$statef\" 2>/dev/null" EXIT
+      "run_$id" )
+    rc=$?
+    if [[ -s $statef ]]; then
+      # shellcheck disable=SC1090
+      source <(sed '1s/^declare -A/declare -gA/' "$statef")
+    fi
+    rm -f "$statef"; STATEF=""
+    case $rc in
+      0)  RESULT[$id]=ok; state_mark "$id" ok ;;
+      10) RESULT[$id]=skipped; state_mark "$id" skipped ;;
+      *)  RESULT[$id]=failed; state_mark "$id" failed; log_err "$title: $(t run.failed)" ;;
+    esac
+  done
+}
+
+summary() {
+  local id status mark notes="" out
+  log_step "$(t summary.title)"
+  for id in "${FEATURE_IDS[@]}"; do
+    feature_selected "$id" || continue
+    status=${RESULT[$id]:-skipped}
+    case $status in
+      ok)      mark="${C_GREEN}✓${C_RESET} $(t summary.ok)" ;;
+      skipped) mark="${C_YELLOW}–${C_RESET} $(t summary.skipped)" ;;
+      failed)  mark="${C_RED}✗${C_RESET} $(t summary.failed)" ;;
+    esac
+    printf '  %s  %s\n' "$mark" "$(t "feat.$id.title")"
+    if [[ $status == ok ]] && declare -F "notes_$id" >/dev/null; then
+      out=$("notes_$id" 2>/dev/null || true)
+      [[ -n $out ]] && notes+="$out"$'\n'
+    fi
+  done
+
+  if [[ -n $notes || -f /var/run/reboot-required ]]; then
+    printf '\n%s%s%s\n' "$C_BOLD" "$(t summary.next)" "$C_RESET"
+    [[ -n $notes ]] && printf '%s' "$notes" | sed 's/^/  /'
+    [[ -f /var/run/reboot-required ]] && printf '  %s\n' "$(t note.reboot)"
+  fi
+  printf '\n%s\n' "$(t summary.log "$LOG_FILE")"
+  (( DRY_RUN )) && printf '%s\n' "$(t summary.dry)"
+
+  for id in "${!RESULT[@]}"; do [[ ${RESULT[$id]} == failed ]] && return 1; done
+  return 0
+}
+
+# ------------------------------------------------------------------ management commands
+# --list-sites, --remove-domain, --list-databases, --drop-database: no menus, no feature run.
+# Only the destructive ones need whiptail, and only when they have to ask (no --yes).
+manage_main() {
+  local rc=0
+  [[ -n $LANG_CODE ]] || LANG_CODE=en
+  case $MANAGE in
+    remove_domain|drop_database) ensure_whiptail ;;
+  esac
+  ui_init
+  choose_language
+  case $MANAGE in
+    doctor)    doctor_main; return "$?" ;;
+    update)    self_update; return "$?" ;;
+    uninstall) local -a uargs=(); (( ASSUME_YES )) && uargs+=(--yes); (( DRY_RUN )) && uargs+=(--dry-run)
+               exec bash "$ROOT_DIR/lib/uninstall.sh" "${uargs[@]}" ;;
+  esac
+  detect_os || die "$(t err.os_unsupported "unknown")"
+  os_check || rc=$?
+  case $rc in
+    2) die "$(t err.os_unsupported "$OS_PRETTY")" ;;
+    1) log_warn "$(t warn.os_untested "$OS_PRETTY")" ;;
+    3) log_warn "$(t warn.os_eol "$OS_PRETTY")" ;;
+  esac
+  load_modules
+  detect_hw
+  case $MANAGE in
+    list_sites)     list_sites ;;
+    list_databases) list_databases ;;
+    remove_domain)  remove_domain "${CFG[arg_manage]}" ;;
+    drop_database)  drop_database "${CFG[arg_manage]}" ;;
+  esac
+}
+
+# ------------------------------------------------------------------ main
+main() {
+  preflight_root
+  trap cleanup_on_exit EXIT
+  trap on_interrupt INT TERM
+  acquire_lock
+  if [[ -n $MANAGE ]]; then manage_main; return "$?"; fi
+  if (( ASSUME_YES )) && [[ -z $PRESET ]]; then die "$(t err.yes_preset)"; fi
+  ensure_whiptail
+  ui_init
+  choose_language
+  check_os
+  load_modules
+  detect_hw
+  check_environment
+  welcome
+  select_preset
+  select_features
+  prompt_features
+  review
+  run_features
+  summary
+}
+
+# Run only when executed directly, so tests can source this file and call single functions.
+if [[ ${BASH_SOURCE[0]} == "$0" ]]; then main "$@"; fi
